@@ -20,7 +20,9 @@ ROOT_DIR = os.path.dirname(__file__)
 # The downside is that this method is deprecated, see
 # https://github.com/pypa/setuptools/issues/917
 
-MAIN_CUDA_VERSION = "12.1"
+MAIN_CUDA_VERSION = os.getenv("WORKER_CUDA_VERSION")
+if MAIN_CUDA_VERSION in ["12.1.0", "11.8.0"]:
+    MAIN_CUDA_VERSION = MAIN_CUDA_VERSION[:-2]
 
 # Supported NVIDIA GPU architectures.
 NVIDIA_SUPPORTED_ARCHS = {"7.0", "7.5", "8.0", "8.6", "8.9", "9.0"}
@@ -421,17 +423,24 @@ def read_readme() -> str:
 
 
 def get_requirements() -> List[str]:
-    """Get Python package dependencies from requirements.txt."""
+    """Get Python package dependencies from requirements.txt, ignoring pip options."""
+    requirements_path = "requirements.txt"  # Default requirements file
     if _is_hip():
-        with open(get_path("requirements-rocm.txt")) as f:
-            requirements = f.read().strip().split("\n")
+        requirements_path = get_path("requirements-rocm.txt")
     elif _is_neuron():
-        with open(get_path("requirements-neuron.txt")) as f:
-            requirements = f.read().strip().split("\n")
+        requirements_path = get_path("requirements-neuron.txt")
     else:
-        with open(get_path("requirements.txt")) as f:
-            requirements = f.read().strip().split("\n")
+        requirements_path = get_path("requirements.txt")
+
+    with open(requirements_path) as f:
+        requirements = []
+        for line in f:
+            # Ignore pip options and empty lines
+            if not line.strip().startswith('--') and line.strip():
+                requirements.append(line.strip())
+        
     return requirements
+
 
 
 package_data = {
