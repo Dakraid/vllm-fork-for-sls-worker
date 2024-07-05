@@ -6,10 +6,15 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                set_weight_attrs)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
@@ -22,24 +27,25 @@ GPTQ_MARLIN_SUPPORTED_SYM = [True]
 
 
 # Permutations for Marlin scale shuffling
-def get_scale_perms(num_bits):
-    scale_perm = []
+def get_scale_perms(num_bits: int):
+    scale_perm: List[int] = []
     for i in range(8):
         scale_perm.extend([i + 8 * j for j in range(8)])
-    scale_perm_single = []
+    scale_perm_single: List[int] = []
     for i in range(4):
         scale_perm_single.extend(
             [2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
     return scale_perm, scale_perm_single
 
 
-def get_pack_factor(num_bits):
+def get_pack_factor(num_bits: int):
     assert (num_bits in GPTQ_MARLIN_SUPPORTED_NUM_BITS
             ), f"Unsupported num_bits = {num_bits}"
     return 32 // num_bits
 
 
-def marlin_permute_scales(s, size_k, size_n, group_size, num_bits):
+def marlin_permute_scales(s: torch.Tensor, size_k: int, size_n: int,
+                          group_size: int, num_bits: int):
     scale_perm, scale_perm_single = get_scale_perms(num_bits)
     if group_size < size_k and group_size != -1:
         s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
@@ -54,7 +60,7 @@ class GPTQMarlinConfig(QuantizationConfig):
     """Config class for GPTQ Marlin"""
 
     def __init__(self, weight_bits: int, group_size: int, desc_act: bool,
-                 is_sym: bool) -> None:
+                 is_sym: bool, lm_head_quantized: bool) -> None:
         if desc_act and group_size == -1:
             # In this case, act_order == True is the same as act_order == False
             # (since we have only one group per output channel)
@@ -64,6 +70,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         self.group_size = group_size
         self.desc_act = desc_act
         self.is_sym = is_sym
+        self.lm_head_quantized = lm_head_quantized
 
         # Verify
         if self.weight_bits not in GPTQ_MARLIN_SUPPORTED_NUM_BITS:
@@ -91,7 +98,8 @@ class GPTQMarlinConfig(QuantizationConfig):
     def __repr__(self) -> str:
         return (f"GPTQMarlinConfig(weight_bits={self.weight_bits}, "
                 f"group_size={self.group_size}, "
-                f"desc_act={self.desc_act})")
+                f"desc_act={self.desc_act}, "
+                f"lm_head_quantized={self.lm_head_quantized})")
 
     @classmethod
     def get_name(cls) -> str:
@@ -99,7 +107,7 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half]
+        return [torch.half, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -115,12 +123,36 @@ class GPTQMarlinConfig(QuantizationConfig):
         group_size = cls.get_from_keys(config, ["group_size"])
         desc_act = cls.get_from_keys(config, ["desc_act"])
         is_sym = cls.get_from_keys(config, ["sym"])
-        return cls(weight_bits, group_size, desc_act, is_sym)
+        lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"],
+                                                 default=False)
+        return cls(weight_bits, group_size, desc_act, is_sym,
+                   lm_head_quantized)
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg,
+                                     user_quant) -> Optional[str]:
+        can_convert = cls.is_marlin_compatible(hf_quant_cfg)
+
+        is_valid_user_quant = (user_quant is None or user_quant == "marlin")
+
+        if can_convert and is_valid_user_quant:
+            msg = ("The model is convertible to {} during runtime."
+                   " Using {} kernel.".format(cls.get_name(), cls.get_name()))
+            logger.info(msg)
+            return cls.get_name()
+
+        if can_convert and user_quant == "gptq":
+            logger.info("Detected that the model can run with gptq_marlin"
+                        ", however you specified quantization=gptq explicitly,"
+                        " so forcing gptq. Use quantization=gptq_marlin for"
+                        " faster inference")
+        return None
 
     def get_quant_method(
             self,
             layer: torch.nn.Module) -> Optional["GPTQMarlinLinearMethod"]:
-        if isinstance(layer, LinearBase):
+        if (isinstance(layer, LinearBase) or
+            (isinstance(layer, ParallelLMHead) and self.lm_head_quantized)):
             return GPTQMarlinLinearMethod(self)
         return None
 
@@ -141,7 +173,7 @@ class GPTQMarlinConfig(QuantizationConfig):
             return False
 
         # If the capability of the device is too low, cannot convert.
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = current_platform.get_device_capability()
         device_capability = major * 10 + minor
         if device_capability < cls.get_min_capability():
             return False
@@ -186,9 +218,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
             group_size = input_size
 
         # Validate dtype
-        if params_dtype != torch.float16:
-            raise ValueError(
-                f"The params dtype must be float16, but got {params_dtype}")
+        if params_dtype not in [torch.float16, torch.bfloat16]:
+            raise ValueError(f"The params dtype must be float16 "
+                             f"or bfloat16, but got {params_dtype}")
 
         # Validate output_size_per_partition
         output_size_per_partition = sum(output_partition_sizes)
@@ -275,14 +307,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
             },
         )
 
-        g_idx_sort_indices = Parameter(
-            torch.empty(
-                g_idx.shape,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
+        g_idx_sort_indices = torch.empty(
+            g_idx.shape,
+            dtype=torch.int32,
         )
-        set_weight_attrs(g_idx_sort_indices, extra_weight_attrs)
 
         # Scales
         scales = Parameter(
@@ -333,9 +361,9 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
 
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("g_idx", g_idx)
-        layer.register_parameter("g_idx_sort_indices", g_idx_sort_indices)
         layer.register_parameter("scales", scales)
         layer.register_parameter("qzeros", qzeros)
+        layer.g_idx_sort_indices = g_idx_sort_indices
         layer.workspace = workspace
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
