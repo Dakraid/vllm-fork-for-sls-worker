@@ -3,7 +3,8 @@
 Using VLMs
 ==========
 
-vLLM provides experimental support for Vision Language Models (VLMs). This document shows you how to run and serve these models using vLLM.
+vLLM provides experimental support for Vision Language Models (VLMs). See the :ref:`list of supported VLMs here <supported_vlms>`.
+This document shows you how to run and serve these models using vLLM.
 
 .. important::
     We are actively iterating on VLM support. Expect breaking changes to VLM usage and development in upcoming releases without prior deprecation.
@@ -29,7 +30,7 @@ To initialize a VLM, the aforementioned arguments must be passed to the ``LLM`` 
     internally for each model.
 
 
-To pass an image to the model, note the following in :class:`vllm.inputs.PromptStrictInputs`:
+To pass an image to the model, note the following in :class:`vllm.inputs.PromptInputs`:
 
 * ``prompt``: The prompt should follow the format that is documented on HuggingFace.
 * ``multi_modal_data``: This is a dictionary that follows the schema defined in :class:`vllm.multimodal.MultiModalDataDict`. 
@@ -93,9 +94,7 @@ Below is an example on how to launch the same ``llava-hf/llava-1.5-7b-hf`` with 
 
 .. code-block:: bash
 
-    python -m vllm.entrypoints.openai.api_server \
-        --model llava-hf/llava-1.5-7b-hf \
-        --chat-template template_llava.jinja
+    vllm serve llava-hf/llava-1.5-7b-hf --chat-template template_llava.jinja
 
 .. important::
     We have removed all vision language related CLI args in the ``0.5.1`` release. **This is a breaking change**, so please update your code to follow
