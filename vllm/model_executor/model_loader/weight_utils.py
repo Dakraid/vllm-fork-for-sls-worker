@@ -24,7 +24,6 @@ from vllm.model_executor.layers.quantization import (QuantizationConfig,
 from vllm.model_executor.layers.quantization.schema import QuantParamSchema
 from vllm.utils import print_warning_once
 
-
 logger = init_logger(__name__)
 
 # use system-level temp directory for file locks, so that multiple users
@@ -117,11 +116,9 @@ def convert_bin_to_safetensor_file(
 
 
 # TODO(woosuk): Move this to other place.
-def get_quant_config(model_config,
-                     load_config):
-    from vllm.model_executor.layers.quantization import (QuantizationConfig,
-                                                     get_quantization_config)
-    from vllm.model_executor.layers.quantization.schema import QuantParamSchema
+def get_quant_config(model_config: ModelConfig,
+                     load_config: LoadConfig) -> QuantizationConfig:
+
     quant_cls = get_quantization_config(model_config.quantization)
     # Read the quantization config from the HF model config, if available.
     hf_quant_config = getattr(model_config.hf_config, "quantization_config",
